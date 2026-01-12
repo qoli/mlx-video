@@ -16,15 +16,6 @@ pip install git+https://github.com/Blaizzy/mlx-video.git
 uv pip install git+https://github.com/Blaizzy/mlx-video.git
 ```
 
-### Optional Dependencies
-
-For video encoding/decoding:
-
-```bash
-pip install imageio[ffmpeg] pillow
-```
-
-
 Supported models:
 
 ### LTX-2
