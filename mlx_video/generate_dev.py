@@ -275,7 +275,7 @@ def load_audio_decoder(model_path: Path):
         out_ch=2,  # stereo
         ch_mult=(1, 2, 4),
         num_res_blocks=2,
-        attn_resolutions={8, 16, 32},
+        attn_resolutions=set(),  # PyTorch uses empty set (no attention in audio decoder)
         resolution=256,
         z_channels=AUDIO_LATENT_CHANNELS,
         norm_type=NormType.PIXEL,
@@ -289,6 +289,7 @@ def load_audio_decoder(model_path: Path):
         weight_file = model_path / "ltx-2-19b-distilled.safetensors"
 
     if weight_file.exists():
+        print(f"Loading audio VAE decoder from {weight_file}...")
         raw_weights = mx.load(str(weight_file))
         sanitized = sanitize_audio_vae_weights(raw_weights)
         if sanitized:
