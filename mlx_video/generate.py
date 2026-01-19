@@ -1,13 +1,14 @@
+
 import argparse
 import time
 from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+
 
 # ANSI color codes
 class Colors:
@@ -21,24 +22,32 @@ class Colors:
     DIM = "\033[2m"
     RESET = "\033[0m"
 
+
 from mlx_video.models.ltx.config import LTXModelConfig, LTXModelType, LTXRopeType
 from mlx_video.models.ltx.ltx import LTXModel
 from mlx_video.models.ltx.transformer import Modality
-from mlx_video.convert import sanitize_transformer_weights, sanitize_vae_encoder_weights
-from mlx_video.utils import to_denoised, load_image, prepare_image_for_encoding
+from mlx_video.convert import sanitize_transformer_weights
+from mlx_video.utils import to_denoised, load_image, prepare_image_for_encoding, get_model_path
 from mlx_video.models.ltx.video_vae.decoder import load_vae_decoder
 from mlx_video.models.ltx.video_vae.encoder import load_vae_encoder
 from mlx_video.models.ltx.video_vae.tiling import TilingConfig
 from mlx_video.models.ltx.upsampler import load_upsampler, upsample_latents
 from mlx_video.conditioning import VideoConditionByLatentIndex, apply_conditioning
-from mlx_video.conditioning.latent import LatentState, create_initial_state, apply_denoise_mask, add_noise_with_state
-
-from mlx_video.utils import get_model_path
+from mlx_video.conditioning.latent import LatentState, apply_denoise_mask
 
 
 # Distilled sigma schedules
 STAGE_1_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
+
+# Audio constants
+AUDIO_SAMPLE_RATE = 24000  # Output audio sample rate
+AUDIO_LATENT_SAMPLE_RATE = 16000  # VAE internal sample rate
+AUDIO_HOP_LENGTH = 160
+AUDIO_LATENT_DOWNSAMPLE_FACTOR = 4
+AUDIO_LATENT_CHANNELS = 8  # Latent channels before patchifying
+AUDIO_MEL_BINS = 16
+AUDIO_LATENTS_PER_SECOND = AUDIO_LATENT_SAMPLE_RATE / AUDIO_HOP_LENGTH / AUDIO_LATENT_DOWNSAMPLE_FACTOR  # 25
 
 
 def create_position_grid(
@@ -115,6 +124,43 @@ def create_position_grid(
     return mx.array(pixel_coords, dtype=mx.float32)
 
 
+def create_audio_position_grid(
+    batch_size: int,
+    audio_frames: int,
+    sample_rate: int = AUDIO_LATENT_SAMPLE_RATE,
+    hop_length: int = AUDIO_HOP_LENGTH,
+    downsample_factor: int = AUDIO_LATENT_DOWNSAMPLE_FACTOR,
+    is_causal: bool = True,
+) -> mx.array:
+    """Create temporal position grid for audio RoPE.
+
+    Audio positions are timestamps in seconds, shape (B, 1, T, 2).
+    Matches PyTorch's AudioPatchifier.get_patch_grid_bounds exactly.
+    """
+    def get_audio_latent_time_in_sec(start_idx: int, end_idx: int) -> np.ndarray:
+        """Convert latent indices to seconds."""
+        latent_frame = np.arange(start_idx, end_idx, dtype=np.float32)
+        mel_frame = latent_frame * downsample_factor
+        if is_causal:
+            mel_frame = np.clip(mel_frame + 1 - downsample_factor, 0, None)
+        return mel_frame * hop_length / sample_rate
+
+    start_times = get_audio_latent_time_in_sec(0, audio_frames)
+    end_times = get_audio_latent_time_in_sec(1, audio_frames + 1)
+
+    positions = np.stack([start_times, end_times], axis=-1)
+    positions = positions[np.newaxis, np.newaxis, :, :]  # (1, 1, T, 2)
+    positions = np.tile(positions, (batch_size, 1, 1, 1))
+
+    return mx.array(positions, dtype=mx.float32)
+
+
+def compute_audio_frames(num_video_frames: int, fps: float) -> int:
+    """Compute number of audio latent frames given video duration."""
+    duration = num_video_frames / fps
+    return round(duration * AUDIO_LATENTS_PER_SECOND)
+
+
 def denoise(
     latents: mx.array,
     positions: mx.array,
@@ -123,27 +169,37 @@ def denoise(
     sigmas: list,
     verbose: bool = True,
     state: Optional[LatentState] = None,
-) -> mx.array:
-    """Run denoising loop with optional conditioning.
+    # Audio parameters (optional)
+    audio_latents: Optional[mx.array] = None,
+    audio_positions: Optional[mx.array] = None,
+    audio_embeddings: Optional[mx.array] = None,
+) -> tuple[mx.array, Optional[mx.array]]:
+    """Run denoising loop with optional conditioning and optional audio.
 
     Args:
-        latents: Noisy latent tensor (B, C, F, H, W)
-        positions: Position embeddings
-        text_embeddings: Text conditioning embeddings
+        latents: Noisy video latent tensor (B, C, F, H, W)
+        positions: Video position embeddings
+        text_embeddings: Video text conditioning embeddings
         transformer: LTX model
         sigmas: List of sigma values for denoising schedule
         verbose: Whether to show progress bar
         state: Optional LatentState for I2V conditioning
+        audio_latents: Optional audio latent tensor (B, C, T, F) for audio generation
+        audio_positions: Optional audio position embeddings
+        audio_embeddings: Optional audio text embeddings
 
     Returns:
-        Denoised latent tensor
+        Tuple of (video_latents, audio_latents) - audio_latents is None if audio disabled
     """
-    # If state is provided, use its latent (which may have conditioning applied)
     dtype = latents.dtype
+    enable_audio = audio_latents is not None
+
+    # If state is provided, use its latent (which may have conditioning applied)
     if state is not None:
         latents = state.latent
 
-    for i in tqdm(range(len(sigmas) - 1), desc="Denoising", disable=not verbose):
+    desc = "Denoising A/V" if enable_audio else "Denoising"
+    for i in tqdm(range(len(sigmas) - 1), desc=desc, disable=not verbose):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
 
         b, c, f, h, w = latents.shape
@@ -172,28 +228,163 @@ def denoise(
             enabled=True,
         )
 
-        velocity, _ = transformer(video=video_modality, audio=None)
+        # Prepare audio modality if enabled
+        audio_modality = None
+        if enable_audio:
+            ab, ac, at, af = audio_latents.shape
+            audio_flat = mx.transpose(audio_latents, (0, 2, 1, 3))  # (B, T, C, F)
+            audio_flat = mx.reshape(audio_flat, (ab, at, ac * af))
+
+            audio_modality = Modality(
+                latent=audio_flat,
+                timesteps=mx.full((ab, at), sigma, dtype=dtype),
+                positions=audio_positions,
+                context=audio_embeddings,
+                context_mask=None,
+                enabled=True,
+            )
+
+        velocity, audio_velocity = transformer(video=video_modality, audio=audio_modality)
         mx.eval(velocity)
+        if audio_velocity is not None:
+            mx.eval(audio_velocity)
 
         velocity = mx.reshape(mx.transpose(velocity, (0, 2, 1)), (b, c, f, h, w))
         denoised = to_denoised(latents, velocity, sigma)
+
+        # Handle audio velocity if enabled
+        audio_denoised = None
+        if enable_audio and audio_velocity is not None:
+            ab, ac, at, af = audio_latents.shape
+            audio_velocity = mx.reshape(audio_velocity, (ab, at, ac, af))
+            audio_velocity = mx.transpose(audio_velocity, (0, 2, 1, 3))  # (B, C, T, F)
+            audio_denoised = to_denoised(audio_latents, audio_velocity, sigma)
 
         # Apply conditioning mask if state is provided
         if state is not None:
             denoised = apply_denoise_mask(denoised, state.clean_latent, state.denoise_mask)
 
         mx.eval(denoised)
+        if audio_denoised is not None:
+            mx.eval(audio_denoised)
 
         # Euler step (preserve dtype by converting Python floats to arrays)
         if sigma_next > 0:
             sigma_next_arr = mx.array(sigma_next, dtype=dtype)
             sigma_arr = mx.array(sigma, dtype=dtype)
             latents = denoised + sigma_next_arr * (latents - denoised) / sigma_arr
+            if enable_audio and audio_denoised is not None:
+                audio_latents = audio_denoised + sigma_next_arr * (audio_latents - audio_denoised) / sigma_arr
         else:
             latents = denoised
-        mx.eval(latents)
+            if enable_audio and audio_denoised is not None:
+                audio_latents = audio_denoised
 
-    return latents
+        mx.eval(latents)
+        if enable_audio:
+            mx.eval(audio_latents)
+
+    return latents, audio_latents if enable_audio else None
+
+
+def load_audio_decoder(model_path: Path):
+    """Load audio VAE decoder."""
+    from mlx_video.models.ltx.audio_vae import AudioDecoder, CausalityAxis, NormType
+    from mlx_video.convert import sanitize_audio_vae_weights
+
+    decoder = AudioDecoder(
+        ch=128,
+        out_ch=2,  # stereo
+        ch_mult=(1, 2, 4),
+        num_res_blocks=2,
+        attn_resolutions=set(),
+        resolution=256,
+        z_channels=AUDIO_LATENT_CHANNELS,
+        norm_type=NormType.PIXEL,
+        causality_axis=CausalityAxis.HEIGHT,
+        mel_bins=64,
+    )
+
+    weight_file = model_path / "ltx-2-19b-distilled.safetensors"
+    if weight_file.exists():
+        raw_weights = mx.load(str(weight_file))
+        sanitized = sanitize_audio_vae_weights(raw_weights)
+        if sanitized:
+            decoder.load_weights(list(sanitized.items()), strict=False)
+
+            if "per_channel_statistics._mean_of_means" in sanitized:
+                decoder.per_channel_statistics._mean_of_means = sanitized["per_channel_statistics._mean_of_means"]
+            if "per_channel_statistics._std_of_means" in sanitized:
+                decoder.per_channel_statistics._std_of_means = sanitized["per_channel_statistics._std_of_means"]
+
+    return decoder
+
+
+def load_vocoder(model_path: Path):
+    """Load vocoder for mel to waveform conversion."""
+    from mlx_video.models.ltx.audio_vae import Vocoder
+    from mlx_video.convert import sanitize_vocoder_weights
+
+    vocoder = Vocoder(
+        resblock_kernel_sizes=[3, 7, 11],
+        upsample_rates=[6, 5, 2, 2, 2],
+        upsample_kernel_sizes=[16, 15, 8, 4, 4],
+        resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+        upsample_initial_channel=1024,
+        stereo=True,
+        output_sample_rate=AUDIO_SAMPLE_RATE,
+    )
+
+    weight_file = model_path / "ltx-2-19b-distilled.safetensors"
+    if weight_file.exists():
+        raw_weights = mx.load(str(weight_file))
+        sanitized = sanitize_vocoder_weights(raw_weights)
+        if sanitized:
+            vocoder.load_weights(list(sanitized.items()), strict=False)
+
+    return vocoder
+
+
+def save_audio(audio: np.ndarray, path: Path, sample_rate: int = AUDIO_SAMPLE_RATE):
+    """Save audio to WAV file."""
+    import wave
+
+    if audio.ndim == 2:
+        audio = audio.T  # (channels, samples) -> (samples, channels)
+
+    audio = np.clip(audio, -1.0, 1.0)
+    audio_int16 = (audio * 32767).astype(np.int16)
+
+    with wave.open(str(path), 'wb') as wf:
+        wf.setnchannels(2 if audio_int16.ndim == 2 else 1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio_int16.tobytes())
+
+
+def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
+    """Combine video and audio into final output using ffmpeg."""
+    import subprocess
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        str(output_path)
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"{Colors.RED}FFmpeg error: {e.stderr.decode()}{Colors.RESET}")
+        return False
+    except FileNotFoundError:
+        print(f"{Colors.RED}FFmpeg not found. Please install ffmpeg.{Colors.RESET}")
+        return False
 
 
 def generate_video(
@@ -216,8 +407,11 @@ def generate_video(
     image_frame_idx: int = 0,
     tiling: str = "auto",
     stream: bool = False,
+    # Audio options
+    audio: bool = False,
+    output_audio_path: Optional[str] = None,
 ):
-    """Generate video from text prompt, optionally conditioned on an image.
+    """Generate video from text prompt, optionally conditioned on an image and with audio.
 
     Args:
         model_repo: Model repository ID
@@ -245,25 +439,36 @@ def generate_video(
             - "conservative": 768px spatial, 96 frame temporal (faster)
             - "spatial": Spatial tiling only
             - "temporal": Temporal tiling only
+        stream: Stream frames to output as they're decoded (requires tiling)
+        audio: Enable synchronized audio generation
+        output_audio_path: Path to save audio file (default: same as video with .wav)
     """
     start_time = time.time()
 
     # Validate dimensions
     assert height % 64 == 0, f"Height must be divisible by 64, got {height}"
     assert width % 64 == 0, f"Width must be divisible by 64, got {width}"
-    
+
     if num_frames % 8 != 1:
         adjusted_num_frames = round((num_frames - 1) / 8) * 8 + 1
         print(f"{Colors.YELLOW}⚠️  Number of frames must be 1 + 8*k. Using nearest valid value: {adjusted_num_frames}{Colors.RESET}")
         num_frames = adjusted_num_frames
 
-
     is_i2v = image is not None
     mode_str = "I2V" if is_i2v else "T2V"
+    if audio:
+        mode_str += "+Audio"
+
     print(f"{Colors.BOLD}{Colors.CYAN}🎬 [{mode_str}] Generating {width}x{height} video with {num_frames} frames{Colors.RESET}")
     print(f"{Colors.DIM}Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}{Colors.RESET}")
     if is_i2v:
         print(f"{Colors.DIM}Image: {image} (strength={image_strength}, frame={image_frame_idx}){Colors.RESET}")
+
+    # Calculate audio frames if enabled
+    audio_frames = None
+    if audio:
+        audio_frames = compute_audio_frames(num_frames, fps)
+        print(f"{Colors.DIM}Audio: {audio_frames} latent frames @ {AUDIO_SAMPLE_RATE}Hz{Colors.RESET}")
 
     # Get model path
     model_path = get_model_path(model_repo)
@@ -289,22 +494,32 @@ def generate_video(
         prompt = text_encoder.enhance_t2v(prompt, max_tokens=max_tokens, temperature=temperature, seed=seed, verbose=verbose)
         print(f"{Colors.DIM}Enhanced: {prompt[:150]}{'...' if len(prompt) > 150 else ''}{Colors.RESET}")
 
-    text_embeddings, _ = text_encoder(prompt, return_audio_embeddings=False)
+    # Get embeddings - with audio if enabled
+    if audio:
+        text_embeddings, audio_embeddings = text_encoder(prompt, return_audio_embeddings=True)
+        mx.eval(text_embeddings, audio_embeddings)
+    else:
+        text_embeddings, _ = text_encoder(prompt, return_audio_embeddings=False)
+        audio_embeddings = None
+        mx.eval(text_embeddings)
+
     model_dtype = text_embeddings.dtype  # bfloat16 from text encoder
-    mx.eval(text_embeddings)
 
     del text_encoder
     mx.clear_cache()
 
     # Load transformer
-    print(f"{Colors.BLUE}🤖 Loading transformer...{Colors.RESET}")
+    print(f"{Colors.BLUE}🤖 Loading transformer{' (A/V mode)' if audio else ''}...{Colors.RESET}")
     raw_weights = mx.load(str(model_path / 'ltx-2-19b-distilled.safetensors'))
     sanitized = sanitize_transformer_weights(raw_weights)
     # Convert transformer weights to bfloat16 for memory efficiency
     sanitized = {k: v.astype(mx.bfloat16) if v.dtype == mx.float32 else v for k, v in sanitized.items()}
 
-    config = LTXModelConfig(
-        model_type=LTXModelType.VideoOnly,
+    # Configure model type based on audio flag
+    model_type = LTXModelType.AudioVideo if audio else LTXModelType.VideoOnly
+
+    config_kwargs = dict(
+        model_type=model_type,
         num_attention_heads=32,
         attention_head_dim=128,
         in_channels=128,
@@ -320,7 +535,19 @@ def generate_video(
         timestep_scale_multiplier=1000,
     )
 
-    transformer = LTXModel(config)                                                                                                                                                                
+    if audio:
+        config_kwargs.update(
+            audio_num_attention_heads=32,
+            audio_attention_head_dim=64,
+            audio_in_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,  # 8 * 16 = 128
+            audio_out_channels=AUDIO_LATENT_CHANNELS * AUDIO_MEL_BINS,
+            audio_cross_attention_dim=2048,
+            audio_positional_embedding_max_pos=[20],
+        )
+
+    config = LTXModelConfig(**config_kwargs)
+
+    transformer = LTXModel(config)
     transformer.load_weights(list(sanitized.items()), strict=False)
     mx.eval(transformer.parameters())
 
@@ -356,6 +583,14 @@ def generate_video(
     # Position grids stay float32 for RoPE precision
     positions = create_position_grid(1, latent_frames, stage1_h, stage1_w)
     mx.eval(positions)
+
+    # Create audio positions if enabled
+    audio_positions = None
+    audio_latents = None
+    if audio:
+        audio_positions = create_audio_position_grid(1, audio_frames)
+        audio_latents = mx.random.normal((1, AUDIO_LATENT_CHANNELS, audio_frames, AUDIO_MEL_BINS)).astype(model_dtype)
+        mx.eval(audio_positions, audio_latents)
 
     # Apply I2V conditioning if provided
     state1 = None
@@ -394,7 +629,11 @@ def generate_video(
         latents = mx.random.normal((1, 128, latent_frames, stage1_h, stage1_w), dtype=model_dtype)
         mx.eval(latents)
 
-    latents = denoise(latents, positions, text_embeddings, transformer, STAGE_1_SIGMAS, verbose=verbose, state=state1)
+    latents, audio_latents = denoise(
+        latents, positions, text_embeddings, transformer, STAGE_1_SIGMAS,
+        verbose=verbose, state=state1,
+        audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
+    )
 
     # Upsample latents
     print(f"{Colors.MAGENTA}🔍 Upsampling latents 2x...{Colors.RESET}")
@@ -447,6 +686,13 @@ def generate_video(
         )
         latents = state2.latent
         mx.eval(latents)
+
+        # Audio also gets noise for stage 2 if enabled
+        if audio and audio_latents is not None:
+            audio_noise = mx.random.normal(audio_latents.shape).astype(model_dtype)
+            one_minus_scale = mx.array(1.0, dtype=model_dtype) - noise_scale
+            audio_latents = audio_noise * noise_scale + audio_latents * one_minus_scale
+            mx.eval(audio_latents)
     else:
         # T2V: add noise to all frames for refinement
         noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
@@ -455,7 +701,17 @@ def generate_video(
         latents = noise * noise_scale + latents * one_minus_scale
         mx.eval(latents)
 
-    latents = denoise(latents, positions, text_embeddings, transformer, STAGE_2_SIGMAS, verbose=verbose, state=state2)
+        # Audio also gets noise for stage 2 if enabled
+        if audio and audio_latents is not None:
+            audio_noise = mx.random.normal(audio_latents.shape).astype(model_dtype)
+            audio_latents = audio_noise * noise_scale + audio_latents * one_minus_scale
+            mx.eval(audio_latents)
+
+    latents, audio_latents = denoise(
+        latents, positions, text_embeddings, transformer, STAGE_2_SIGMAS,
+        verbose=verbose, state=state2,
+        audio_latents=audio_latents, audio_positions=audio_positions, audio_embeddings=audio_embeddings,
+    )
 
     del transformer
     mx.clear_cache()
@@ -496,7 +752,7 @@ def generate_video(
         video_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
         stream_pbar = tqdm(total=num_frames, desc="Streaming", unit="frame")
 
-        def on_frames_ready(frames: mx.array, start_idx: int):
+        def on_frames_ready(frames: mx.array, _start_idx: int):
             """Callback to write frames as they're finalized."""
             # frames: (B, 3, num_frames, H, W)
             frames = mx.squeeze(frames, axis=0)  # (3, num_frames, H, W)
@@ -542,18 +798,65 @@ def generate_video(
         video = (video * 255).astype(mx.uint8)
         video_np = np.array(video)
 
-        # Save video normally
+        # For audio mode, save to temp file first
+        if audio:
+            temp_video_path = output_path.with_suffix('.temp.mp4')
+            save_path = temp_video_path
+        else:
+            save_path = output_path
+
+        # Save video
         try:
             import cv2
             h, w = video_np.shape[1], video_np.shape[2]
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+            out = cv2.VideoWriter(str(save_path), fourcc, fps, (w, h))
             for frame in video_np:
                 out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             out.release()
-            print(f"{Colors.GREEN}✅ Saved video to{Colors.RESET} {output_path}")
+            if not audio:
+                print(f"{Colors.GREEN}✅ Saved video to{Colors.RESET} {output_path}")
         except Exception as e:
             print(f"{Colors.RED}❌ Could not save video: {e}{Colors.RESET}")
+
+    # Decode and save audio if enabled
+    audio_np = None
+    if audio and audio_latents is not None:
+        print(f"{Colors.BLUE}🔊 Decoding audio...{Colors.RESET}")
+        audio_decoder = load_audio_decoder(model_path)
+        vocoder = load_vocoder(model_path)
+        mx.eval(audio_decoder.parameters(), vocoder.parameters())
+
+        mel_spectrogram = audio_decoder(audio_latents)
+        mx.eval(mel_spectrogram)
+
+        audio_waveform = vocoder(mel_spectrogram)
+        mx.eval(audio_waveform)
+
+        audio_np = np.array(audio_waveform)
+        if audio_np.ndim == 3:
+            audio_np = audio_np[0]
+
+        del audio_decoder, vocoder
+        mx.clear_cache()
+
+        # Save audio
+        audio_path = Path(output_audio_path) if output_audio_path else output_path.with_suffix('.wav')
+        save_audio(audio_np, audio_path, AUDIO_SAMPLE_RATE)
+        print(f"{Colors.GREEN}✅ Saved audio to{Colors.RESET} {audio_path}")
+
+        # Mux video and audio
+        print(f"{Colors.BLUE}🎬 Combining video and audio...{Colors.RESET}")
+        temp_video_path = output_path.with_suffix('.temp.mp4')
+        if mux_video_audio(temp_video_path, audio_path, output_path):
+            print(f"{Colors.GREEN}✅ Saved video with audio to{Colors.RESET} {output_path}")
+            temp_video_path.unlink()
+        else:
+            temp_video_path.rename(output_path)
+            print(f"{Colors.YELLOW}⚠️  Saved video without audio to{Colors.RESET} {output_path}")
+
+    del vae_decoder
+    mx.clear_cache()
 
     if save_frames:
         frames_dir = output_path.parent / f"{output_path.stem}_frames"
@@ -566,12 +869,14 @@ def generate_video(
     print(f"{Colors.BOLD}{Colors.GREEN}🎉 Done! Generated in {elapsed:.1f}s ({elapsed/num_frames:.2f}s/frame){Colors.RESET}")
     print(f"{Colors.BOLD}{Colors.GREEN}✨ Peak memory: {mx.get_peak_memory() / (1024 ** 3):.2f}GB{Colors.RESET}")
 
+    if audio:
+        return video_np, audio_np
     return video_np
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate videos with MLX LTX-2 (T2V and I2V)",
+        description="Generate videos with MLX LTX-2 (T2V, I2V, and Audio)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -583,6 +888,11 @@ Examples:
   # Image-to-Video (I2V)
   python -m mlx_video.generate --prompt "A person dancing" --image photo.jpg
   python -m mlx_video.generate --prompt "Waves crashing" --image beach.png --image-strength 0.8
+
+  # With Audio (T2V+Audio or I2V+Audio)
+  python -m mlx_video.generate --prompt "Ocean waves crashing" --audio
+  python -m mlx_video.generate --prompt "A jazz band playing" --audio --enhance-prompt
+  python -m mlx_video.generate --prompt "Waves crashing" --image beach.png --audio
         """
     )
 
@@ -623,7 +933,7 @@ Examples:
         help="Frames per second for output video (default: 24)"
     )
     parser.add_argument(
-        "--output-path",
+        "--output-path", "-o",
         type=str,
         default="output.mp4",
         help="Output video path (default: output.mp4)"
@@ -699,10 +1009,42 @@ Examples:
         action="store_true",
         help="Stream frames to output file as they're decoded (requires tiling). Allows viewing partial results sooner."
     )
+    # Audio options
+    parser.add_argument(
+        "--audio", "-a",
+        action="store_true",
+        help="Enable synchronized audio generation"
+    )
+    parser.add_argument(
+        "--output-audio",
+        type=str,
+        default=None,
+        help="Output audio path (default: same as video with .wav)"
+    )
     args = parser.parse_args()
 
     generate_video(
-        **vars(args)
+        model_repo=args.model_repo,
+        text_encoder_repo=args.text_encoder_repo,
+        prompt=args.prompt,
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+        seed=args.seed,
+        fps=args.fps,
+        output_path=args.output_path,
+        save_frames=args.save_frames,
+        verbose=args.verbose,
+        enhance_prompt=args.enhance_prompt,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        image=args.image,
+        image_strength=args.image_strength,
+        image_frame_idx=args.image_frame_idx,
+        tiling=args.tiling,
+        stream=args.stream,
+        audio=args.audio,
+        output_audio_path=args.output_audio,
     )
 
 
